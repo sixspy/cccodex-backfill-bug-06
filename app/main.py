@@ -28,6 +28,13 @@ def _json(resp, data, status=200):
     resp.text = json.dumps(data, ensure_ascii=False)
 
 
+def _fail(resp, exc: ServiceError):
+    """错误一律回白话；有结构化拒签载荷时一并带回，前端据此亮拒签芯片。"""
+    body = {"error": exc.message, "ok": False}
+    body.update(exc.payload)
+    _json(resp, body, exc.status_code)
+
+
 def _read_session(req) -> dict:
     raw = req.get_cookie_values("backfill_session")
     if not raw:
@@ -105,7 +112,7 @@ class ApiMeta:
             require_user(req)
             _json(resp, {"lab": Config.LAB_NAME, "product": "cc-backfill-lab"})
         except ServiceError as exc:
-            _json(resp, {"error": exc.message}, exc.status_code)
+            _fail(resp, exc)
 
 
 class ApiWindows:
@@ -114,7 +121,7 @@ class ApiWindows:
             require_user(req)
             _json(resp, {"items": list_windows()})
         except ServiceError as exc:
-            _json(resp, {"error": exc.message}, exc.status_code)
+            _fail(resp, exc)
 
 
 class ApiPlan:
@@ -123,7 +130,7 @@ class ApiPlan:
             require_user(req)
             _json(resp, plan_slices(int(window_id)))
         except ServiceError as exc:
-            _json(resp, {"error": exc.message}, exc.status_code)
+            _fail(resp, exc)
 
 
 class ApiSlices:
@@ -132,7 +139,7 @@ class ApiSlices:
             require_user(req)
             _json(resp, {"items": list_slices(int(window_id))})
         except ServiceError as exc:
-            _json(resp, {"error": exc.message}, exc.status_code)
+            _fail(resp, exc)
 
 
 class ApiReplay:
@@ -141,7 +148,7 @@ class ApiReplay:
             require_user(req)
             _json(resp, {"slice": replay_slice(int(slice_id))})
         except ServiceError as exc:
-            _json(resp, {"error": exc.message}, exc.status_code)
+            _fail(resp, exc)
 
 
 class ApiCoverage:
@@ -150,7 +157,7 @@ class ApiCoverage:
             require_user(req)
             _json(resp, {"items": list_coverage()})
         except ServiceError as exc:
-            _json(resp, {"error": exc.message}, exc.status_code)
+            _fail(resp, exc)
 
     async def on_post(self, req, resp):
         try:
@@ -159,7 +166,7 @@ class ApiCoverage:
             wid = int(body.get("window_id"))
             _json(resp, {"report": coverage_report(wid)})
         except ServiceError as exc:
-            _json(resp, {"error": exc.message}, exc.status_code)
+            _fail(resp, exc)
         except (TypeError, ValueError):
             _json(resp, {"error": "window_id 无效"}, 400)
 
@@ -178,16 +185,23 @@ class ApiDayCut:
                 ),
             )
         except ServiceError as exc:
-            _json(resp, {"error": exc.message}, exc.status_code)
+            _fail(resp, exc)
 
 
 class ApiDayCorrect:
     async def on_post(self, req, resp):
         try:
             require_user(req)
-            _json(resp, daycut_svc.correct())
+            body = await req.get_media() or {}
+            _json(
+                resp,
+                daycut_svc.correct(
+                    body.get("cut_point"),
+                    body.get("expected_version"),
+                ),
+            )
         except ServiceError as exc:
-            _json(resp, {"error": exc.message}, exc.status_code)
+            _fail(resp, exc)
 
 
 class ApiDayPanels:
@@ -196,7 +210,7 @@ class ApiDayPanels:
             require_user(req)
             _json(resp, daycut_svc.panels())
         except ServiceError as exc:
-            _json(resp, {"error": exc.message}, exc.status_code)
+            _fail(resp, exc)
 
 
 def create_app() -> falcon.asgi.App:

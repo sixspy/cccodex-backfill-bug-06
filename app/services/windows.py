@@ -1,6 +1,7 @@
 from datetime import date, timedelta
 
-from app.db import get_db
+from app.db import get_db, log_op, write_tx
+from app.services import daycut
 from app.services.errors import ServiceError
 
 
@@ -37,6 +38,7 @@ def plan_slices(window_id: int, db_path: str | None = None) -> dict:
             raise ServiceError("回灌窗口不存在", 404)
         if win["status"] not in ("草稿", "已计划"):
             raise ServiceError("当前状态不可再生成切片", 409)
+        daycut.ensure_plannable(win["start_date"], win["end_date"], db_path)
         days = _daterange(win["start_date"], win["end_date"])
         conn.execute("DELETE FROM backfill_slices WHERE window_id=?", (window_id,))
         for d in days:
@@ -66,7 +68,9 @@ def list_slices(window_id: int, db_path: str | None = None) -> list[dict]:
 
 
 def replay_slice(slice_id: int, db_path: str | None = None) -> dict:
-    with get_db(db_path) as conn:
+    rejection: tuple[str, dict] | None = None
+    result: dict | None = None
+    with write_tx(db_path) as conn:
         sl = conn.execute(
             "SELECT * FROM backfill_slices WHERE id=?", (slice_id,)
         ).fetchone()
@@ -76,29 +80,55 @@ def replay_slice(slice_id: int, db_path: str | None = None) -> dict:
             raise ServiceError("切片已落库", 409)
         if sl["status"] != "待重放":
             raise ServiceError("仅待重放切片可重放", 409)
-        # deterministic fake row count from date digits
-        rows = 100 + int(sl["slice_date"].replace("-", "")) % 97
-        conn.execute(
-            "UPDATE backfill_slices SET status='已落库', row_count=? WHERE id=?",
-            (rows, slice_id),
-        )
-        conn.execute(
-            "UPDATE backfill_windows SET status='执行中' WHERE id=?",
-            (sl["window_id"],),
-        )
-        pending = conn.execute(
-            "SELECT COUNT(*) AS c FROM backfill_slices WHERE window_id=? AND status!='已落库'",
-            (sl["window_id"],),
-        ).fetchone()["c"]
-        if pending == 0:
+        # 重放前复验：双界或窗口内挂着串日脏片，一律拒签，不写落库状态。
+        win = conn.execute(
+            "SELECT * FROM backfill_windows WHERE id=?", (sl["window_id"],)
+        ).fetchone()
+        blockers = daycut.blockers_in(conn, win["start_date"], win["end_date"])
+        if blockers:
+            first = blockers[0]
+            reason = first.get("reason") or (
+                f"该日存在串日活动片（{first.get('row_key', '未知键')}），片归属与切点不同源"
+            )
+            # 拒签也要留痕，故提交后出事务再抛。
+            log_op(
+                conn,
+                "replay",
+                f"切片#{slice_id} {sl['slice_date']} 复验未通过：{reason}",
+                "拒签",
+            )
+            rejection = (f"重放已拒签：{reason}；请先纠偏再重放", {"chip": "拒签"})
+        else:
+            # deterministic fake row count from date digits
+            rows = 100 + int(sl["slice_date"].replace("-", "")) % 97
             conn.execute(
-                "UPDATE backfill_windows SET status='已完成' WHERE id=?",
+                "UPDATE backfill_slices SET status='已落库', row_count=? WHERE id=?",
+                (rows, slice_id),
+            )
+            conn.execute(
+                "UPDATE backfill_windows SET status='执行中' WHERE id=?",
                 (sl["window_id"],),
             )
-        row = conn.execute(
-            "SELECT * FROM backfill_slices WHERE id=?", (slice_id,)
-        ).fetchone()
-        return dict(row)
+            pending = conn.execute(
+                "SELECT COUNT(*) AS c FROM backfill_slices WHERE window_id=? AND status!='已落库'",
+                (sl["window_id"],),
+            ).fetchone()["c"]
+            if pending == 0:
+                conn.execute(
+                    "UPDATE backfill_windows SET status='已完成' WHERE id=?",
+                    (sl["window_id"],),
+                )
+            log_op(conn, "replay", f"切片#{slice_id} {sl['slice_date']} 落库 {rows} 行", "已切")
+            row = conn.execute(
+                "SELECT * FROM backfill_slices WHERE id=?", (slice_id,)
+            ).fetchone()
+            result = dict(row)
+
+    if rejection is not None:
+        message, payload = rejection
+        raise ServiceError(message, 409, payload)
+    assert result is not None
+    return result
 
 
 def coverage_report(window_id: int, db_path: str | None = None) -> dict:
